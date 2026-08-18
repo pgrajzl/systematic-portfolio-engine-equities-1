@@ -94,3 +94,76 @@ def load_price_data():
     close = pd.read_csv(DATA_DIR / "close.csv", index_col=0, parse_dates=True)
     volume = pd.read_csv(DATA_DIR / "volume.csv", index_col=0, parse_dates=True)
     return universe, close, volume
+
+def fill_short_gaps(close, market_ticker="SPY", max_gap_days=3, beta_window=60):
+    """
+    Fills short gaps (1 to max_gap_days consecutive missing days) in
+    price data by estimating the missing price from the market's
+    return over the gap, scaled by the stock's own trailing beta
+    (estimated from the days right before the gap). This lets the
+    price move a plausible amount during the gap, rather than sitting
+    flat the way a plain forward fill would, which would otherwise
+    create artificial zero-return days and understate variance/beta.
+
+    Gaps longer than max_gap_days are left as NaN, since a longer
+    absence is more likely a real event than a short data provider
+    hiccup, and shouldn't be silently patched over.
+
+    close: DataFrame of daily close prices, shaped dates x tickers.
+        Must include market_ticker as one of the columns.
+    beta_window: number of trading days before a gap used to estimate
+        a short-term beta for filling that specific gap
+    """
+    if market_ticker not in close.columns:
+        raise ValueError(f"'{market_ticker}' not found in close price columns.")
+
+    filled = close.copy()
+    market_returns = close[market_ticker].pct_change()
+
+    for ticker in close.columns:
+        if ticker == market_ticker:
+            continue
+
+        series = close[ticker]
+        is_missing = series.isna()
+        if not is_missing.any():
+            continue
+
+        # Identify runs of consecutive missing days
+        gap_id = (is_missing != is_missing.shift()).cumsum()
+        gap_groups = series[is_missing].groupby(gap_id[is_missing])
+
+        for _, gap_dates in gap_groups.groups.items():
+            gap_dates = list(gap_dates)
+            if len(gap_dates) > max_gap_days:
+                continue  # leave longer gaps as NaN
+
+            gap_start_idx = close.index.get_loc(gap_dates[0])
+            if gap_start_idx == 0:
+                continue  # can't fill a gap with no prior price
+
+            last_good_date = close.index[gap_start_idx - 1]
+            last_good_price = series.loc[last_good_date]
+            if pd.isna(last_good_price):
+                continue
+
+            # Estimate this stock's short-term beta from the window
+            # right before the gap
+            pre_gap_stock_returns = series.loc[:last_good_date].pct_change().tail(beta_window)
+            pre_gap_market_returns = market_returns.loc[:last_good_date].tail(beta_window)
+            cov = pre_gap_stock_returns.cov(pre_gap_market_returns)
+            var = pre_gap_market_returns.var()
+            local_beta = cov / var if var and not pd.isna(var) else 1.0
+
+            # Walk forward through the gap, applying each day's SPY
+            # return scaled by the local beta to the running price
+            running_price = last_good_price
+            for gap_date in gap_dates:
+                market_return = market_returns.loc[gap_date]
+                if pd.isna(market_return):
+                    break  # can't estimate without a market return that day
+                estimated_return = local_beta * market_return
+                running_price = running_price * (1 + estimated_return)
+                filled.loc[gap_date, ticker] = running_price
+
+    return filled
